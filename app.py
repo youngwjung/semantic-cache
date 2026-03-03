@@ -161,7 +161,7 @@ if cache:
         if not hits:
             return None
 
-        hits = sorted(hits, key=lambda h: h.score, reverse=True)
+        hits = sorted(hits, key=lambda h: h.score)
         top_hit = hits[0]
         score = 1 - (top_hit.score / 2)
         if score < min_similarity:
