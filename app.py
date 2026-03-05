@@ -17,6 +17,9 @@ st.title("Semantic Caching Demo")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+
 # 세션에 저장된 메세지를 화면에 표시
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -58,6 +61,11 @@ if rag:
 
     selected_kb_name = st.sidebar.selectbox(
         "Knowledge Base 선택", options=list(kb_options.keys())
+    )
+
+    # 문서 관련성 점수 임계값 설정
+    rag_score_threshold = st.sidebar.slider(
+        "문서 관련성 점수 임계값", 0.0, 1.0, 0.8, 0.05
     )
 
     # 선택된 Knowledge Base의 Date Source 확인
@@ -117,14 +125,14 @@ if rag:
 
                 time.sleep(5)
 
-    st.sidebar.divider()
-
 # Cache
-cache = st.sidebar.toggle("Cache", value=False)
+cache = False
+if rag:
+    cache = st.sidebar.toggle("Cache", value=False)
 
 if cache:
-    # 유사도 설정
-    similarity = st.sidebar.slider("유사도", 0.0, 1.0, 0.9, 0.05)
+    # 유사도 임계값 설정
+    cache_similarity_threshold = st.sidebar.slider("유사도 임계값", 0.0, 1.0, 0.9, 0.05)
 
     valkey_client = Valkey(
         host=os.getenv("VALKEY_HOST"),
@@ -134,13 +142,14 @@ if cache:
 
     embeddings = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0")
 
+    # Valkey 벡터 저장소 설정
     store = ValkeyStore(
         client=valkey_client,
         index={
             "collection_name": "semantic_cache",
             "embed": embeddings,
             "fields": ["query"],
-            "index_type": "HNSW",
+            "index_type": "FLAT",
             "distance_metric": "COSINE",
             "dims": 1024,
         },
@@ -152,22 +161,25 @@ if cache:
         return md5(query.encode("utf-8")).hexdigest()
 
     # 캐시 검색
-    def search_cache(
-        user_message: str, k: int = 3, min_similarity: float = 0.8
-    ) -> str | None:
+    def search_cache(user_message: str, k: int = 3) -> tuple[dict | None, float | None]:
         hits = store.search(
             namespace_prefix=("semantic-cache",), query=user_message, limit=k
         )
         if not hits:
-            return None
+            return None, None
 
+        # 유사도가 높은순으로 정렬
         hits = sorted(hits, key=lambda h: h.score)
-        top_hit = hits[0]
-        score = 1 - (top_hit.score / 2)
-        if score < min_similarity:
-            return None
+        for hit in hits:
+            add_log(f"{hit.value['query']}, {hit.score}")
 
-        return top_hit.value["answer"]
+        # 유사도가 가장 높은 결과
+        top_hit = hits[0]
+
+        # 유사도 점수를 0 - 1 사이로 정규화
+        score = 1 - top_hit.score
+
+        return top_hit.value, score
 
     # 캐시 저장
     def store_cache(user_message: str, result_message: str) -> None:
@@ -178,17 +190,66 @@ if cache:
             value={"query": user_message, "answer": result_message},
         )
 
+    # 캐시 목록 조회
+    def get_cache_items():
+        items = []
+        for key in valkey_client.scan_iter(match="langgraph:semantic-cache/*"):
+            data = valkey_client.hgetall(key)
+            query = data.get(b"query")
+            if query:
+                items.append(query.decode("utf-8"))
+        return items
+
+    # 캐시 목록 표시
+    with st.sidebar.expander("캐시 목록"):
+        items = get_cache_items()
+        if items:
+            to_delete = []
+            for item in items:
+                if st.checkbox(item):
+                    to_delete.append(item)
+            # 캐시 삭제
+            if to_delete and st.button("🗑️ 삭제", use_container_width=True):
+                keys = [
+                    f"langgraph:semantic-cache/{cache_key_for_query(q)}"
+                    for q in to_delete
+                ]
+                valkey_client.delete(*keys)
+                st.rerun()
+        else:
+            st.caption("저장된 캐시 없음")
+
 
 # 채팅 기록 삭제 버튼
 if st.sidebar.button("🗑️ 채팅 기록 삭제", use_container_width=True):
     st.session_state.messages = []
-    if hasattr(st, "rerun"):
-        st.rerun()
-    else:
-        st.experimental_rerun()
+    st.session_state.logs = []
+    st.rerun()
+
+# 로그 컨테이너
+st.sidebar.markdown("로그")
+log_container = st.sidebar.empty()
+
+
+# 로그 렌더링
+def render_logs():
+    if st.session_state.logs:
+        log_container.code("\n".join(st.session_state.logs), language=None)
+
+
+def add_log(msg: str):
+    st.session_state.logs.append(msg)
+    render_logs()
+
+
+# 초기 로그 렌더링
+render_logs()
 
 # 사용자가 메시지를 입력
 if prompt := st.chat_input("무엇이든 물어보세요."):
+    # 이전 로그 초기화
+    st.session_state.logs = []
+
     # 세션에 사용자가 입력한 메시지 추가
     st.session_state.messages.append({"role": "user", "content": [{"text": prompt}]})
 
@@ -205,93 +266,142 @@ if prompt := st.chat_input("무엇이든 물어보세요."):
             # 스트리밍 데이터 임시 저장
             buffer = ""
 
-            if cache:
-                cached = search_cache(prompt, min_similarity=similarity)
+            # RAG가 활성화 된 경우
+            if rag:
+                # 캐시가 활성화 된 경우
+                if cache:
+                    # 캐시 검색
+                    add_log(f"[Cache] 캐시 검색 중... 'query: {prompt}'")
+                    match, score = search_cache(prompt)
 
-                if cached:
-                    buffer = cached
-                    cache_hit = True
-                else:
-                    if rag:
-                        # 추론 요청
-                        response = (
-                            bedrock_agent_runtime_client.retrieve_and_generate_stream(
-                                input={"text": prompt},
-                                retrieveAndGenerateConfiguration={
-                                    "type": "KNOWLEDGE_BASE",
-                                    "knowledgeBaseConfiguration": {
-                                        "knowledgeBaseId": kb_options[selected_kb_name],
-                                        "modelArn": model_options[selected_model_name],
-                                    },
-                                },
-                            )
-                        )
-
-                        # 이벤트가 수신되면
-                        for event in response.get("stream", []):
-                            # 이벤트에 응답 세그먼트가 존재하면
-                            if "output" in event:
-                                # 텍스트 축출
-                                chunk = event["output"]["text"]
-                                if chunk:
-                                    # 버퍼에 응답 세그먼트 추가
-                                    buffer += chunk
-                                    # 현재까지 수신된 응답을 화면에 표시
-                                    placeholder.markdown(buffer)
+                    # 유사한 쿼리가 검색된 경우
+                    if match and cache_similarity_threshold < score:
+                        buffer = match["answer"]
+                        cache_hit = True
+                        add_log(f"[Cache] Hit | {match['query']} | 유사도: {score:.2f}")
+                    # 유사한 쿼리가 없으면
                     else:
-                        # 추론 요청
-                        response = bedrock_runtime_client.converse_stream(
-                            modelId=model_options[selected_model_name],
-                            messages=st.session_state.messages,
-                        )
+                        if score is not None:
+                            add_log(
+                                f"[Cache] Miss | {match['query']} | 유사도: {score:.2f} | 임계값: {cache_similarity_threshold})"
+                            )
+                        else:
+                            add_log("[Cache] Miss | 저장된 캐시 없음")
 
-                        # 이벤트가 수신되면
-                        for event in response.get("stream", []):
-                            # 이벤트에 응답 세그먼트가 존재하면
-                            if "contentBlockDelta" in event:
-                                # 텍스트 축출
-                                delta = event["contentBlockDelta"].get("delta", {})
-                                chunk = delta.get("text", "")
-                                if chunk:
-                                    # 버퍼에 응답 세그먼트 추가
-                                    buffer += chunk
-                                    # 현재까지 수신된 응답을 화면에 표시
-                                    placeholder.markdown(buffer)
-
-                    store_cache(prompt, buffer.strip())
-
-            else:
-                if rag:
-                    # 추론 요청
-                    response = (
-                        bedrock_agent_runtime_client.retrieve_and_generate_stream(
-                            input={"text": prompt},
-                            retrieveAndGenerateConfiguration={
-                                "type": "KNOWLEDGE_BASE",
-                                "knowledgeBaseConfiguration": {
-                                    "knowledgeBaseId": kb_options[selected_kb_name],
-                                    "modelArn": model_options[selected_model_name],
-                                },
+                        add_log("[RAG] Knowledge Base 검색 중...")
+                        # 문서 검색
+                        retrieve_response = bedrock_agent_runtime_client.retrieve(
+                            knowledgeBaseId=kb_options[selected_kb_name],
+                            retrievalQuery={"text": prompt},
+                            retrievalConfiguration={
+                                "vectorSearchConfiguration": {"numberOfResults": 5}
                             },
                         )
-                    )
+                        results = retrieve_response.get("retrievalResults", [])
 
-                    # 이벤트가 수신되면
-                    for event in response.get("stream", []):
-                        # 이벤트에 응답 세그먼트가 존재하면
-                        if "output" in event:
-                            # 텍스트 축출
-                            chunk = event["output"]["text"]
-                            if chunk:
-                                # 버퍼에 응답 세그먼트 추가
-                                buffer += chunk
-                                # 현재까지 수신된 응답을 화면에 표시
-                                placeholder.markdown(buffer)
+                        # 문서 관련성 로그
+                        for r in results:
+                            add_log(
+                                f"  [{r.get('score', 0):.2f}] {r['content']['text'][:40]}..."
+                            )
+
+                        # 관련성 임계값 이상 문서만 필터링
+                        relevant_docs = [
+                            r
+                            for r in results
+                            if r.get("score", 0) >= rag_score_threshold
+                        ]
+
+                        if relevant_docs:
+                            add_log(
+                                f"[RAG] 관련 문서 {len(relevant_docs)}개 → LLM 호출"
+                            )
+                            context = "\n\n---\n\n".join(
+                                [doc["content"]["text"] for doc in relevant_docs]
+                            )
+                            messages = st.session_state.messages + [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "text": f"참고 문서:\n\n{context}\n\n질문: {prompt}"
+                                        }
+                                    ],
+                                }
+                            ]
+
+                            # 추론 요청
+                            response = bedrock_runtime_client.converse_stream(
+                                modelId=model_options[selected_model_name],
+                                messages=messages,
+                            )
+
+                            # 이벤트가 수신되면
+                            for event in response.get("stream", []):
+                                # 이벤트에 응답 세그먼트가 존재하면
+                                if "contentBlockDelta" in event:
+                                    # 텍스트 축출
+                                    delta = event["contentBlockDelta"].get("delta", {})
+                                    chunk = delta.get("text", "")
+                                    if chunk:
+                                        # 버퍼에 응답 세그먼트 추가
+                                        buffer += chunk
+                                        # 현재까지 수신된 응답을 화면에 표시
+                                        placeholder.markdown(buffer)
+
+                            add_log("[Cache] 캐시 저장 완료")
+                            store_cache(prompt, buffer.strip())
+                        else:
+                            add_log("[RAG] 관련 문서 없음 → 캐시 저장 안함")
+                            buffer = "관련 문서를 찾을 수 없습니다."
+                            placeholder.markdown(buffer)
+
+                # 캐시가 활성화 안된 경우
                 else:
-                    # 추론 요청
+                    add_log("[RAG] Knowledge Base 검색 중...")
+                    # 문서 검색
+                    retrieve_response = bedrock_agent_runtime_client.retrieve(
+                        knowledgeBaseId=kb_options[selected_kb_name],
+                        retrievalQuery={"text": prompt},
+                        retrievalConfiguration={
+                            "vectorSearchConfiguration": {"numberOfResults": 5}
+                        },
+                    )
+                    results = retrieve_response.get("retrievalResults", [])
+
+                    # 문서 관련성 로그
+                    for r in results:
+                        add_log(
+                            f"  [{r.get('score', 0):.2f}] {r['content']['text'][:40]}..."
+                        )
+
+                    # 관련성 임계값 이상 문서만 필터링
+                    relevant_docs = [
+                        r for r in results if r.get("score", 0) >= rag_score_threshold
+                    ]
+
+                    if relevant_docs:
+                        add_log(f"[RAG] 관련 문서 {len(relevant_docs)}개 → LLM 호출")
+                        context = "\n\n---\n\n".join(
+                            [doc["content"]["text"] for doc in relevant_docs]
+                        )
+                        messages = st.session_state.messages + [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "text": f"참고 문서:\n\n{context}\n\n질문: {prompt}"
+                                    }
+                                ],
+                            }
+                        ]
+                    else:
+                        add_log("[RAG] 관련 문서 없음 → 일반 LLM 호출")
+                        messages = st.session_state.messages
+
                     response = bedrock_runtime_client.converse_stream(
                         modelId=model_options[selected_model_name],
-                        messages=st.session_state.messages,
+                        messages=messages,
                     )
 
                     # 이벤트가 수신되면
@@ -307,6 +417,27 @@ if prompt := st.chat_input("무엇이든 물어보세요."):
                                 # 현재까지 수신된 응답을 화면에 표시
                                 placeholder.markdown(buffer)
 
+            else:
+                add_log("[LLM] 추론 요청 중...")
+                # 추론 요청
+                response = bedrock_runtime_client.converse_stream(
+                    modelId=model_options[selected_model_name],
+                    messages=st.session_state.messages,
+                )
+
+                # 이벤트가 수신되면
+                for event in response.get("stream", []):
+                    # 이벤트에 응답 세그먼트가 존재하면
+                    if "contentBlockDelta" in event:
+                        # 텍스트 축출
+                        delta = event["contentBlockDelta"].get("delta", {})
+                        chunk = delta.get("text", "")
+                        if chunk:
+                            # 버퍼에 응답 세그먼트 추가
+                            buffer += chunk
+                            # 현재까지 수신된 응답을 화면에 표시
+                            placeholder.markdown(buffer)
+
             # 수신 완료된 응답
             response_text = buffer.strip() or ""
         # 에러가 발생하면 에러 메세지를 응답으로 화면에 표시
@@ -319,7 +450,7 @@ if prompt := st.chat_input("무엇이든 물어보세요."):
                 response_text
                 + """
                 <div style='text-align: right; color: gray; font-size: 16px; margin-top: 4px;'>
-                    Cache Hit    
+                    Cache Hit
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -331,3 +462,7 @@ if prompt := st.chat_input("무엇이든 물어보세요."):
     st.session_state.messages.append(
         {"role": "assistant", "content": [{"text": response_text}]}
     )
+
+    # 캐시 미스로 새 항목이 저장된 경우 목록 즉시 갱신
+    if cache and not cache_hit:
+        st.rerun()
