@@ -224,6 +224,13 @@ module "valkey" {
   create_parameter_group = true
   parameter_group_family = "valkey8"
 
+  parameters = [
+    {
+      name  = "reserved-memory-percent"
+      value = "50"
+    }
+  ]
+
   log_delivery_configuration = {}
 }
 
